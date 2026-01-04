@@ -9,6 +9,7 @@ from bpy.props import StringProperty, BoolProperty, EnumProperty, CollectionProp
 from bpy.types import PropertyGroup, Operator, Panel, UIList
 import os
 import shutil
+import hashlib
 from pathlib import Path
 
 
@@ -24,6 +25,16 @@ class PROJMAN_ExternalFile(PropertyGroup):
     file_size: IntProperty(name="Size (bytes)")
     exists: BoolProperty(name="Exists", default=True)
     selected: BoolProperty(name="Selected", default=True)
+    file_hash: StringProperty(name="File Hash")  # For duplicate detection
+
+
+class PROJMAN_DuplicateGroup(PropertyGroup):
+    """Represents a group of duplicate files."""
+    hash_value: StringProperty(name="Hash")
+    file_count: IntProperty(name="Count")
+    file_names: StringProperty(name="Files")  # Comma-separated list of names
+    file_type: StringProperty(name="Type")
+    total_size: IntProperty(name="Total Size")
 
 
 class PROJMAN_Properties(PropertyGroup):
@@ -78,6 +89,25 @@ class PROJMAN_Properties(PropertyGroup):
         default=True
     )
 
+    # Selective Packing Options
+    pack_images: BoolProperty(
+        name="Images",
+        description="Pack image textures into the .blend file",
+        default=True
+    )
+
+    pack_sounds: BoolProperty(
+        name="Sounds",
+        description="Pack audio files into the .blend file",
+        default=True
+    )
+
+    pack_fonts: BoolProperty(
+        name="Fonts",
+        description="Pack font files into the .blend file",
+        default=True
+    )
+
     exclude_unused: BoolProperty(
         name="Exclude Unused Data",
         description="Skip files that are loaded but not used in the scene",
@@ -117,6 +147,12 @@ class PROJMAN_Properties(PropertyGroup):
     total_size: IntProperty(name="Total Size", default=0)
     missing_files: IntProperty(name="Missing Files", default=0)
 
+    # Duplicate detection
+    duplicate_groups: CollectionProperty(type=PROJMAN_DuplicateGroup)
+    active_duplicate_index: IntProperty(name="Active Duplicate Index", default=0)
+    duplicate_count: IntProperty(name="Duplicate Count", default=0)
+    duplicate_wasted_size: IntProperty(name="Wasted Size", default=0)
+
 
 # =============================================================================
 # Utility Functions
@@ -151,6 +187,18 @@ def format_size(size_bytes):
 def is_datablock_used(datablock):
     """Check if a datablock is actually used in the project."""
     return datablock.users > 0
+
+
+def compute_file_hash(filepath, chunk_size=65536):
+    """Compute MD5 hash of a file for duplicate detection."""
+    hasher = hashlib.md5()
+    try:
+        with open(filepath, 'rb') as f:
+            for chunk in iter(lambda: f.read(chunk_size), b''):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+    except (OSError, FileNotFoundError):
+        return None
 
 
 def scan_external_files(context):
@@ -570,6 +618,233 @@ class PROJMAN_OT_open_destination(Operator):
         return {'FINISHED'}
 
 
+class PROJMAN_OT_pack_all(Operator):
+    """Pack all external files into the .blend file"""
+    bl_idname = "project_manager.pack_all"
+    bl_label = "Pack All"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        props = context.scene.project_manager
+        packed_count = 0
+        failed_count = 0
+
+        # Pack Images
+        if props.pack_images:
+            for img in bpy.data.images:
+                if img.packed_file or img.source in {'GENERATED', 'VIEWER'}:
+                    continue
+                if props.exclude_unused and not is_datablock_used(img):
+                    continue
+                if img.filepath:
+                    try:
+                        img.pack()
+                        packed_count += 1
+                    except Exception as e:
+                        self.report({'WARNING'}, f"Failed to pack {img.name}: {str(e)}")
+                        failed_count += 1
+
+        # Pack Sounds
+        if props.pack_sounds:
+            for sound in bpy.data.sounds:
+                if sound.packed_file:
+                    continue
+                if props.exclude_unused and not is_datablock_used(sound):
+                    continue
+                if sound.filepath:
+                    try:
+                        sound.pack()
+                        packed_count += 1
+                    except Exception as e:
+                        self.report({'WARNING'}, f"Failed to pack {sound.name}: {str(e)}")
+                        failed_count += 1
+
+        # Pack Fonts
+        if props.pack_fonts:
+            for font in bpy.data.fonts:
+                if font.packed_file:
+                    continue
+                if not font.filepath or font.filepath == "<builtin>":
+                    continue
+                if props.exclude_unused and not is_datablock_used(font):
+                    continue
+                try:
+                    font.pack()
+                    packed_count += 1
+                except Exception as e:
+                    self.report({'WARNING'}, f"Failed to pack {font.name}: {str(e)}")
+                    failed_count += 1
+
+        msg = f"Packed {packed_count} files"
+        if failed_count > 0:
+            msg += f" ({failed_count} failed)"
+        self.report({'INFO'}, msg)
+        return {'FINISHED'}
+
+
+class PROJMAN_OT_unpack_all(Operator):
+    """Unpack all packed files to the current directory"""
+    bl_idname = "project_manager.unpack_all"
+    bl_label = "Unpack All"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        if not bpy.data.filepath:
+            self.report({'ERROR'}, "Please save the .blend file first")
+            return {'CANCELLED'}
+
+        try:
+            bpy.ops.file.unpack_all(method='USE_LOCAL')
+            self.report({'INFO'}, "Unpacked all files")
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to unpack: {str(e)}")
+            return {'CANCELLED'}
+
+        return {'FINISHED'}
+
+
+class PROJMAN_OT_scan_duplicates(Operator):
+    """Scan for duplicate files in the project"""
+    bl_idname = "project_manager.scan_duplicates"
+    bl_label = "Find Duplicates"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        props = context.scene.project_manager
+        props.duplicate_groups.clear()
+
+        # First, make sure we have scanned for external files
+        if len(props.external_files) == 0:
+            scan_external_files(context)
+
+        # Build hash map
+        hash_map = {}  # hash -> list of (name, filepath, file_type, size)
+
+        for file_entry in props.external_files:
+            if not file_entry.exists:
+                continue
+
+            file_hash = compute_file_hash(file_entry.filepath)
+            if file_hash:
+                file_entry.file_hash = file_hash
+                if file_hash not in hash_map:
+                    hash_map[file_hash] = []
+                hash_map[file_hash].append({
+                    'name': file_entry.name,
+                    'filepath': file_entry.filepath,
+                    'file_type': file_entry.file_type,
+                    'size': file_entry.file_size
+                })
+
+        # Find duplicates (hashes with more than one file)
+        duplicate_count = 0
+        wasted_size = 0
+
+        for file_hash, files in hash_map.items():
+            if len(files) > 1:
+                dup_group = props.duplicate_groups.add()
+                dup_group.hash_value = file_hash
+                dup_group.file_count = len(files)
+                dup_group.file_names = ", ".join([f['name'] for f in files])
+                dup_group.file_type = files[0]['file_type']
+                dup_group.total_size = files[0]['size'] * len(files)
+
+                duplicate_count += len(files) - 1
+                wasted_size += files[0]['size'] * (len(files) - 1)
+
+        props.duplicate_count = duplicate_count
+        props.duplicate_wasted_size = wasted_size
+
+        if duplicate_count > 0:
+            self.report({'INFO'}, f"Found {duplicate_count} duplicate files ({format_size(wasted_size)} wasted)")
+        else:
+            self.report({'INFO'}, "No duplicate files found")
+
+        return {'FINISHED'}
+
+
+class PROJMAN_OT_consolidate_duplicates(Operator):
+    """Make all duplicate files point to a single source"""
+    bl_idname = "project_manager.consolidate_duplicates"
+    bl_label = "Consolidate Duplicates"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        props = context.scene.project_manager
+
+        if len(props.duplicate_groups) == 0:
+            self.report({'WARNING'}, "No duplicates found. Run 'Find Duplicates' first.")
+            return {'CANCELLED'}
+
+        consolidated_count = 0
+
+        # Build a map from hash to the canonical filepath
+        hash_to_files = {}
+        for file_entry in props.external_files:
+            if file_entry.file_hash and file_entry.exists:
+                if file_entry.file_hash not in hash_to_files:
+                    hash_to_files[file_entry.file_hash] = []
+                hash_to_files[file_entry.file_hash].append(file_entry)
+
+        # For each duplicate group, update all datablocks to point to the first file
+        for dup_group in props.duplicate_groups:
+            files = hash_to_files.get(dup_group.hash_value, [])
+            if len(files) < 2:
+                continue
+
+            # Use the first file as the canonical source
+            canonical = files[0]
+            canonical_path = canonical.filepath
+
+            # Make it relative if possible
+            if bpy.data.filepath:
+                try:
+                    canonical_path = bpy.path.relpath(canonical_path)
+                except ValueError:
+                    pass  # Different drive on Windows
+
+            # Update all other datablocks to use the canonical path
+            for dup_file in files[1:]:
+                self._update_datablock_path(dup_file.name, dup_file.file_type, canonical_path)
+                consolidated_count += 1
+
+        if consolidated_count > 0:
+            self.report({'INFO'}, f"Consolidated {consolidated_count} duplicate references")
+            # Re-scan to update the list
+            scan_external_files(context)
+        else:
+            self.report({'INFO'}, "No duplicates to consolidate")
+
+        return {'FINISHED'}
+
+    def _update_datablock_path(self, name, file_type, new_path):
+        """Update the filepath of a datablock."""
+        try:
+            if file_type == "Image":
+                if name in bpy.data.images:
+                    bpy.data.images[name].filepath = new_path
+            elif file_type == "Sound":
+                if name in bpy.data.sounds:
+                    bpy.data.sounds[name].filepath = new_path
+            elif file_type == "Font":
+                if name in bpy.data.fonts:
+                    bpy.data.fonts[name].filepath = new_path
+            elif file_type == "Movie Clip":
+                if name in bpy.data.movieclips:
+                    bpy.data.movieclips[name].filepath = new_path
+            elif file_type == "Cache File":
+                if name in bpy.data.cache_files:
+                    bpy.data.cache_files[name].filepath = new_path
+            elif file_type == "Volume":
+                if name in bpy.data.volumes:
+                    bpy.data.volumes[name].filepath = new_path
+            elif file_type == "Library":
+                if name in bpy.data.libraries:
+                    bpy.data.libraries[name].filepath = new_path
+        except Exception:
+            pass
+
+
 # =============================================================================
 # UI List
 # =============================================================================
@@ -611,6 +886,39 @@ class PROJMAN_UL_files(UIList):
         elif self.layout_type == 'GRID':
             layout.alignment = 'CENTER'
             layout.label(text="", icon='FILE')
+
+
+class PROJMAN_UL_duplicates(UIList):
+    """UI List for displaying duplicate file groups."""
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+
+            # Type icon
+            type_icons = {
+                "Image": 'IMAGE_DATA',
+                "Sound": 'SOUND',
+                "Font": 'FONT_DATA',
+                "Movie Clip": 'FILE_MOVIE',
+                "Cache File": 'FILE_CACHE',
+                "Volume": 'VOLUME_DATA',
+                "Library": 'LIBRARY_DATA_DIRECT'
+            }
+            row.label(text="", icon=type_icons.get(item.file_type, 'FILE'))
+
+            # File count
+            row.label(text=f"{item.file_count}x")
+
+            # File names (truncated)
+            names = item.file_names
+            if len(names) > 40:
+                names = names[:37] + "..."
+            row.label(text=names)
+
+        elif self.layout_type == 'GRID':
+            layout.alignment = 'CENTER'
+            layout.label(text="", icon='DUPLICATE')
 
 
 # =============================================================================
@@ -767,24 +1075,112 @@ class PROJMAN_PT_actions(Panel):
         row.operator("project_manager.collect_files", icon='EXPORT')
 
 
+class PROJMAN_PT_packing(Panel):
+    """Packing panel for Project Manager."""
+    bl_label = "Pack into .blend"
+    bl_idname = "PROJMAN_PT_packing"
+    bl_space_type = 'PROPERTIES'
+    bl_region_type = 'WINDOW'
+    bl_context = "output"
+    bl_parent_id = "PROJMAN_PT_main"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        props = context.scene.project_manager
+
+        # Selective packing options
+        layout.label(text="File Types to Pack:")
+        col = layout.column(align=True)
+        row = col.row(align=True)
+        row.prop(props, "pack_images", toggle=True)
+        row.prop(props, "pack_sounds", toggle=True)
+        row.prop(props, "pack_fonts", toggle=True)
+
+        layout.separator()
+
+        # Pack/Unpack buttons
+        row = layout.row(align=True)
+        row.scale_y = 1.3
+        row.operator("project_manager.pack_all", icon='PACKAGE')
+        row.operator("project_manager.unpack_all", icon='UGLYPACKAGE')
+
+
+class PROJMAN_PT_duplicates(Panel):
+    """Duplicate detection panel for Project Manager."""
+    bl_label = "Duplicate Detection"
+    bl_idname = "PROJMAN_PT_duplicates"
+    bl_space_type = 'PROPERTIES'
+    bl_region_type = 'WINDOW'
+    bl_context = "output"
+    bl_parent_id = "PROJMAN_PT_main"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        props = context.scene.project_manager
+
+        # Scan for duplicates button
+        layout.operator("project_manager.scan_duplicates", icon='VIEWZOOM')
+
+        # Statistics
+        if props.duplicate_count > 0:
+            box = layout.box()
+            col = box.column(align=True)
+            col.label(text=f"Duplicate References: {props.duplicate_count}")
+            col.label(text=f"Wasted Space: {format_size(props.duplicate_wasted_size)}")
+
+        # Duplicate groups list
+        if len(props.duplicate_groups) > 0:
+            row = layout.row()
+            row.template_list(
+                "PROJMAN_UL_duplicates", "",
+                props, "duplicate_groups",
+                props, "active_duplicate_index",
+                rows=4
+            )
+
+            # Show full file names for selected group
+            if props.active_duplicate_index < len(props.duplicate_groups):
+                active_dup = props.duplicate_groups[props.active_duplicate_index]
+                box = layout.box()
+                box.label(text="Duplicate files:", icon='INFO')
+                for name in active_dup.file_names.split(", "):
+                    box.label(text=f"  {name}")
+
+            # Consolidate button
+            layout.separator()
+            row = layout.row()
+            row.scale_y = 1.3
+            row.operator("project_manager.consolidate_duplicates", icon='AUTOMERGE_ON')
+
+
 # =============================================================================
 # Registration
 # =============================================================================
 
 classes = (
     PROJMAN_ExternalFile,
+    PROJMAN_DuplicateGroup,
     PROJMAN_Properties,
     PROJMAN_OT_scan_files,
     PROJMAN_OT_collect_files,
     PROJMAN_OT_select_all,
     PROJMAN_OT_deselect_all,
     PROJMAN_OT_open_destination,
+    PROJMAN_OT_pack_all,
+    PROJMAN_OT_unpack_all,
+    PROJMAN_OT_scan_duplicates,
+    PROJMAN_OT_consolidate_duplicates,
     PROJMAN_UL_files,
+    PROJMAN_UL_duplicates,
     PROJMAN_PT_main,
     PROJMAN_PT_options,
     PROJMAN_PT_files,
     PROJMAN_PT_settings,
     PROJMAN_PT_actions,
+    PROJMAN_PT_packing,
+    PROJMAN_PT_duplicates,
 )
 
 

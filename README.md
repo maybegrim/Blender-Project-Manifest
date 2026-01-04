@@ -57,6 +57,22 @@ One click. Done.
 | **Copy .blend File** | Include a copy of your project file |
 | **Relink Paths** | Update all paths in the copy to point to the new locations |
 
+### Packing
+
+| Feature | Description |
+|---------|-------------|
+| **Pack All** | Embed all external files directly into the .blend file |
+| **Selective Packing** | Choose which file types to pack (images, sounds, fonts) |
+| **Unpack All** | Extract all packed files back to disk |
+
+### Duplicate Detection
+
+| Feature | Description |
+|---------|-------------|
+| **Find Duplicates** | Scan for identical files referenced multiple times |
+| **Consolidate** | Make all duplicate references point to a single file |
+| **Wasted Space** | See how much disk space duplicates are wasting |
+
 ---
 
 ## Installation
@@ -215,10 +231,6 @@ Files that are already packed into the .blend (embedded) are skipped — they're
 
 Planned features for future releases:
 
-- [ ] **Pack All Option** — Embed all external files into the .blend
-- [ ] **Selective Packing** — Pack only specific file types
-- [ ] **Disk Space Calculator** — Preview required space before copying
-- [ ] **Duplicate Detection** — Find and consolidate duplicate files
 - [ ] **Sequence Support** — Handle image sequences intelligently
 - [ ] **Transcode Option** — Convert videos to a consistent format
 - [ ] **CLI Mode** — Run collection from command line for batch processing
