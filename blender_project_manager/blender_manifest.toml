@@ -1,0 +1,17 @@
+schema_version = "1.0.0"
+
+id = "blender_project_manager"
+version = "1.0.0"
+name = "Blender Project Manager"
+tagline = "Collect, consolidate and archive Blender projects with all assets"
+maintainer = "maybegrim"
+type = "add-on"
+
+tags = ["System", "Import-Export"]
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Copy project files to destination folder"
