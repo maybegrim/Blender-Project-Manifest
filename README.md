@@ -2,6 +2,10 @@
 
 A free, open-source Blender extension that collects, consolidates, and archives your Blender projects with all their external assets. Inspired by Adobe Premiere Pro's Project Manager.
 
+
+<img width="562" height="525" alt="532160324-2661990f-ffc2-4530-9fca-f201bb6583dc" src="https://github.com/user-attachments/assets/1af6d089-a7e8-420d-8023-6ece2e30729b" />
+
+
 **Blender 4.2+ | GPL v3 | Free & Open Source**
 
 ---
