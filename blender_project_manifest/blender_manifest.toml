@@ -1,0 +1,17 @@
+schema_version = "1.0.0"
+
+id = "blender_project_manifest"
+version = "1.0.0"
+name = "Blender Project Manifest"
+tagline = "One project. One folder. Zero missing files."
+maintainer = "maybegrim"
+type = "add-on"
+
+tags = ["System", "Import-Export"]
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Copy project files to destination folder"
