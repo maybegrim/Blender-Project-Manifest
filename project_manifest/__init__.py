@@ -1,44 +1,33 @@
-"""
-Blender Project Manifest
-Collect, consolidate and archive Blender projects with all external assets.
-Inspired by Adobe Premiere Pro's Project Manager.
-"""
-
 import bpy
-from bpy.props import StringProperty, BoolProperty, EnumProperty, CollectionProperty, IntProperty
+from bpy.props import StringProperty, BoolProperty, CollectionProperty, IntProperty, FloatProperty
 from bpy.types import PropertyGroup, Operator, Panel, UIList
-import os
-import shutil
+import glob
 import hashlib
-from pathlib import Path
+import os
+import re
+import shutil
 
-
-# =============================================================================
-# Property Groups
-# =============================================================================
 
 class PROJMAN_ExternalFile(PropertyGroup):
-    """Represents an external file found in the project."""
     name: StringProperty(name="Name")
     filepath: StringProperty(name="File Path")
-    file_type: StringProperty(name="Type")  # image, sound, font, library, etc.
-    file_size: IntProperty(name="Size (bytes)")
+    file_type: StringProperty(name="Type")
+    file_size: FloatProperty(name="Size (bytes)")
     exists: BoolProperty(name="Exists", default=True)
     selected: BoolProperty(name="Selected", default=True)
-    file_hash: StringProperty(name="File Hash")  # For duplicate detection
+    file_hash: StringProperty(name="File Hash")
+    member_files: StringProperty(name="Member Files")
 
 
 class PROJMAN_DuplicateGroup(PropertyGroup):
-    """Represents a group of duplicate files."""
     hash_value: StringProperty(name="Hash")
     file_count: IntProperty(name="Count")
-    file_names: StringProperty(name="Files")  # Comma-separated list of names
+    file_names: StringProperty(name="Files")
     file_type: StringProperty(name="Type")
-    total_size: IntProperty(name="Total Size")
+    total_size: FloatProperty(name="Total Size")
 
 
 class PROJMAN_Properties(PropertyGroup):
-    """Main addon properties."""
 
     destination_path: StringProperty(
         name="Destination",
@@ -89,7 +78,12 @@ class PROJMAN_Properties(PropertyGroup):
         default=True
     )
 
-    # Selective Packing Options
+    include_sequencer: BoolProperty(
+        name="Sequencer Strips",
+        description="Include movie and image strips from the Video Sequencer",
+        default=True
+    )
+
     pack_images: BoolProperty(
         name="Images",
         description="Pack image textures into the .blend file",
@@ -138,37 +132,45 @@ class PROJMAN_Properties(PropertyGroup):
         default=True
     )
 
-    # Scan results
     external_files: CollectionProperty(type=PROJMAN_ExternalFile)
     active_file_index: IntProperty(name="Active File Index", default=0)
 
-    # Statistics
     total_files: IntProperty(name="Total Files", default=0)
-    total_size: IntProperty(name="Total Size", default=0)
+    total_size: FloatProperty(name="Total Size", default=0.0)
     missing_files: IntProperty(name="Missing Files", default=0)
 
-    # Duplicate detection
     duplicate_groups: CollectionProperty(type=PROJMAN_DuplicateGroup)
     active_duplicate_index: IntProperty(name="Active Duplicate Index", default=0)
     duplicate_count: IntProperty(name="Duplicate Count", default=0)
-    duplicate_wasted_size: IntProperty(name="Wasted Size", default=0)
+    duplicate_wasted_size: FloatProperty(name="Wasted Size", default=0.0)
 
 
-# =============================================================================
-# Utility Functions
-# =============================================================================
+TYPE_TO_FOLDER = {
+    "Image": "textures",
+    "Sound": "sounds",
+    "Font": "fonts",
+    "Movie Clip": "videos",
+    "Cache File": "caches",
+    "Volume": "volumes",
+    "Library": "libraries",
+    "Movie Strip": "videos",
+    "Image Strip": "textures",
+}
 
-def get_absolute_path(filepath):
-    """Convert a Blender path to an absolute path."""
-    if filepath.startswith("//"):
-        # Relative path
-        blend_dir = os.path.dirname(bpy.data.filepath)
-        return os.path.normpath(os.path.join(blend_dir, filepath[2:]))
-    return os.path.normpath(filepath)
+TYPE_ICONS = {
+    "Image": 'IMAGE_DATA',
+    "Sound": 'SOUND',
+    "Font": 'FONT_DATA',
+    "Movie Clip": 'FILE_MOVIE',
+    "Cache File": 'FILE_CACHE',
+    "Volume": 'VOLUME_DATA',
+    "Library": 'LIBRARY_DATA_DIRECT',
+    "Movie Strip": 'SEQUENCE',
+    "Image Strip": 'RENDERLAYERS',
+}
 
 
 def get_file_size(filepath):
-    """Get file size in bytes, returns 0 if file doesn't exist."""
     try:
         return os.path.getsize(filepath)
     except (OSError, FileNotFoundError):
@@ -176,7 +178,6 @@ def get_file_size(filepath):
 
 
 def format_size(size_bytes):
-    """Format bytes to human readable string."""
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
         if size_bytes < 1024.0:
             return f"{size_bytes:.1f} {unit}"
@@ -184,13 +185,7 @@ def format_size(size_bytes):
     return f"{size_bytes:.1f} PB"
 
 
-def is_datablock_used(datablock):
-    """Check if a datablock is actually used in the project."""
-    return datablock.users > 0
-
-
 def compute_file_hash(filepath, chunk_size=65536):
-    """Compute MD5 hash of a file for duplicate detection."""
     hasher = hashlib.md5()
     try:
         with open(filepath, 'rb') as f:
@@ -201,173 +196,216 @@ def compute_file_hash(filepath, chunk_size=65536):
         return None
 
 
+def resolve_path(filepath, datablock=None):
+    library = getattr(datablock, "library", None) if datablock is not None else None
+    return os.path.normpath(bpy.path.abspath(filepath, library=library))
+
+
+def expand_frame_sequence(filepath):
+    directory, basename = os.path.split(filepath)
+    match = re.search(r"(\d+)(\.[^.]+)?$", basename)
+    if not match:
+        return [filepath]
+    prefix = basename[:match.start(1)]
+    suffix = basename[match.end(1):]
+    pattern = os.path.join(
+        glob.escape(directory),
+        glob.escape(prefix) + "[0-9]" * len(match.group(1)) + glob.escape(suffix)
+    )
+    files = sorted(glob.glob(pattern))
+    return files if files else [filepath]
+
+
+def expand_udim_tiles(filepath, image):
+    members = []
+    for tile in image.tiles:
+        number = tile.number
+        u = (number - 1001) % 10 + 1
+        v = (number - 1001) // 10 + 1
+        path = filepath.replace("<UDIM>", str(number)).replace("<UVTILE>", f"u{u}_v{v}")
+        members.append(path)
+    return members if members else [filepath]
+
+
+def entry_member_files(entry):
+    if entry.member_files:
+        return entry.member_files.split("\n")
+    return [entry.filepath]
+
+
+def iter_strips(scene):
+    editor = scene.sequence_editor
+    if editor is None:
+        return ()
+    if hasattr(editor, "strips_all"):
+        return editor.strips_all
+    return editor.sequences_all
+
+
+def find_strip(name):
+    for scene in bpy.data.scenes:
+        for strip in iter_strips(scene):
+            if strip.name == name:
+                return strip
+    return None
+
+
+def get_data_collection(file_type):
+    return {
+        "Image": bpy.data.images,
+        "Sound": bpy.data.sounds,
+        "Font": bpy.data.fonts,
+        "Movie Clip": bpy.data.movieclips,
+        "Cache File": bpy.data.cache_files,
+        "Volume": bpy.data.volumes,
+        "Library": bpy.data.libraries,
+    }.get(file_type)
+
+
+def apply_new_path(name, file_type, new_path):
+    if file_type == "Movie Strip":
+        strip = find_strip(name)
+        if strip is None:
+            return None
+        old = strip.filepath
+        strip.filepath = new_path
+        return (strip, "filepath", old)
+    if file_type == "Image Strip":
+        strip = find_strip(name)
+        if strip is None:
+            return None
+        old = strip.directory
+        new_dir = os.path.dirname(new_path)
+        strip.directory = new_dir if new_dir.endswith("/") else new_dir + "/"
+        return (strip, "directory", old)
+    collection = get_data_collection(file_type)
+    if collection is None:
+        return None
+    datablock = collection.get((name, None))
+    if datablock is None:
+        return None
+    old = datablock.filepath
+    datablock.filepath = new_path
+    return (datablock, "filepath", old)
+
+
 def scan_external_files(context):
-    """Scan the project for all external file references."""
     props = context.scene.project_manager
     props.external_files.clear()
 
-    total_size = 0
-    missing_count = 0
-
-    # Check if blend file is saved
     if not bpy.data.filepath:
         return {"error": "Please save the .blend file first"}
 
-    # Scan Images
-    if props.include_images:
-        for img in bpy.data.images:
-            # Skip packed, generated, or viewer images
-            if img.packed_file or img.source in {'GENERATED', 'VIEWER'}:
-                continue
-            if props.exclude_unused and not is_datablock_used(img):
-                continue
-            if img.filepath:
-                abs_path = get_absolute_path(img.filepath)
-                exists = os.path.isfile(abs_path)
-                size = get_file_size(abs_path) if exists else 0
+    total_size = 0.0
+    missing_count = 0
+    seen_paths = set()
 
-                file_entry = props.external_files.add()
-                file_entry.name = img.name
-                file_entry.filepath = abs_path
-                file_entry.file_type = "Image"
-                file_entry.file_size = size
-                file_entry.exists = exists
-                file_entry.selected = True
+    def add_entry(name, filepath, file_type, members=None):
+        nonlocal total_size, missing_count
+        file_list = members if members else [filepath]
+        existing = [f for f in file_list if os.path.isfile(f)]
+        exists = len(existing) > 0
+        size = float(sum(get_file_size(f) for f in existing))
 
-                total_size += size
-                if not exists:
-                    missing_count += 1
+        entry = props.external_files.add()
+        entry.name = name
+        entry.filepath = filepath
+        entry.file_type = file_type
+        entry.file_size = size
+        entry.exists = exists
+        entry.selected = True
+        entry.member_files = "\n".join(file_list) if members else ""
 
-    # Scan Sounds
-    if props.include_sounds:
-        for sound in bpy.data.sounds:
-            if sound.packed_file:
-                continue
-            if props.exclude_unused and not is_datablock_used(sound):
-                continue
-            if sound.filepath:
-                abs_path = get_absolute_path(sound.filepath)
-                exists = os.path.isfile(abs_path)
-                size = get_file_size(abs_path) if exists else 0
-
-                file_entry = props.external_files.add()
-                file_entry.name = sound.name
-                file_entry.filepath = abs_path
-                file_entry.file_type = "Sound"
-                file_entry.file_size = size
-                file_entry.exists = exists
-                file_entry.selected = True
-
-                total_size += size
-                if not exists:
-                    missing_count += 1
-
-    # Scan Fonts
-    if props.include_fonts:
-        for font in bpy.data.fonts:
-            if font.packed_file:
-                continue
-            # Built-in font has no filepath
-            if not font.filepath or font.filepath == "<builtin>":
-                continue
-            if props.exclude_unused and not is_datablock_used(font):
-                continue
-
-            abs_path = get_absolute_path(font.filepath)
-            exists = os.path.isfile(abs_path)
-            size = get_file_size(abs_path) if exists else 0
-
-            file_entry = props.external_files.add()
-            file_entry.name = font.name
-            file_entry.filepath = abs_path
-            file_entry.file_type = "Font"
-            file_entry.file_size = size
-            file_entry.exists = exists
-            file_entry.selected = True
-
+        if filepath not in seen_paths:
+            seen_paths.add(filepath)
             total_size += size
             if not exists:
                 missing_count += 1
 
-    # Scan Movie Clips
+    if props.include_images:
+        for img in bpy.data.images:
+            if img.packed_file or img.source in {'GENERATED', 'VIEWER'}:
+                continue
+            if props.exclude_unused and img.users == 0:
+                continue
+            if not img.filepath:
+                continue
+            abs_path = resolve_path(img.filepath, img)
+            if img.source == 'TILED':
+                add_entry(img.name, abs_path, "Image", expand_udim_tiles(abs_path, img))
+            elif img.source == 'SEQUENCE':
+                add_entry(img.name, abs_path, "Image", expand_frame_sequence(abs_path))
+            else:
+                add_entry(img.name, abs_path, "Image")
+
+    if props.include_sounds:
+        for sound in bpy.data.sounds:
+            if sound.packed_file:
+                continue
+            if props.exclude_unused and sound.users == 0:
+                continue
+            if sound.filepath:
+                add_entry(sound.name, resolve_path(sound.filepath, sound), "Sound")
+
+    if props.include_fonts:
+        for font in bpy.data.fonts:
+            if font.packed_file:
+                continue
+            if not font.filepath or font.filepath == "<builtin>":
+                continue
+            if props.exclude_unused and font.users == 0:
+                continue
+            add_entry(font.name, resolve_path(font.filepath, font), "Font")
+
     if props.include_videos:
         for clip in bpy.data.movieclips:
-            if clip.filepath:
-                abs_path = get_absolute_path(clip.filepath)
-                exists = os.path.isfile(abs_path)
-                size = get_file_size(abs_path) if exists else 0
+            if props.exclude_unused and clip.users == 0:
+                continue
+            if not clip.filepath:
+                continue
+            abs_path = resolve_path(clip.filepath, clip)
+            if clip.source == 'SEQUENCE':
+                add_entry(clip.name, abs_path, "Movie Clip", expand_frame_sequence(abs_path))
+            else:
+                add_entry(clip.name, abs_path, "Movie Clip")
 
-                file_entry = props.external_files.add()
-                file_entry.name = clip.name
-                file_entry.filepath = abs_path
-                file_entry.file_type = "Movie Clip"
-                file_entry.file_size = size
-                file_entry.exists = exists
-                file_entry.selected = True
-
-                total_size += size
-                if not exists:
-                    missing_count += 1
-
-    # Scan Cache Files (Alembic, USD, etc.)
     if props.include_caches:
         for cache in bpy.data.cache_files:
+            if props.exclude_unused and cache.users == 0:
+                continue
             if cache.filepath:
-                abs_path = get_absolute_path(cache.filepath)
-                exists = os.path.isfile(abs_path)
-                size = get_file_size(abs_path) if exists else 0
+                add_entry(cache.name, resolve_path(cache.filepath, cache), "Cache File")
 
-                file_entry = props.external_files.add()
-                file_entry.name = cache.name
-                file_entry.filepath = abs_path
-                file_entry.file_type = "Cache File"
-                file_entry.file_size = size
-                file_entry.exists = exists
-                file_entry.selected = True
-
-                total_size += size
-                if not exists:
-                    missing_count += 1
-
-    # Scan Volumes (VDB)
     if props.include_volumes:
         for volume in bpy.data.volumes:
-            if volume.filepath:
-                abs_path = get_absolute_path(volume.filepath)
-                exists = os.path.isfile(abs_path)
-                size = get_file_size(abs_path) if exists else 0
+            if props.exclude_unused and volume.users == 0:
+                continue
+            if not volume.filepath:
+                continue
+            abs_path = resolve_path(volume.filepath, volume)
+            if volume.is_sequence:
+                add_entry(volume.name, abs_path, "Volume", expand_frame_sequence(abs_path))
+            else:
+                add_entry(volume.name, abs_path, "Volume")
 
-                file_entry = props.external_files.add()
-                file_entry.name = volume.name
-                file_entry.filepath = abs_path
-                file_entry.file_type = "Volume"
-                file_entry.file_size = size
-                file_entry.exists = exists
-                file_entry.selected = True
-
-                total_size += size
-                if not exists:
-                    missing_count += 1
-
-    # Scan Linked Libraries
     if props.include_libraries:
         for lib in bpy.data.libraries:
+            if props.exclude_unused and len(lib.users_id) == 0:
+                continue
             if lib.filepath:
-                abs_path = get_absolute_path(lib.filepath)
-                exists = os.path.isfile(abs_path)
-                size = get_file_size(abs_path) if exists else 0
+                add_entry(lib.name, resolve_path(lib.filepath, lib), "Library")
 
-                file_entry = props.external_files.add()
-                file_entry.name = lib.name
-                file_entry.filepath = abs_path
-                file_entry.file_type = "Library"
-                file_entry.file_size = size
-                file_entry.exists = exists
-                file_entry.selected = True
-
-                total_size += size
-                if not exists:
-                    missing_count += 1
+    if props.include_sequencer:
+        for scene in bpy.data.scenes:
+            for strip in iter_strips(scene):
+                if strip.type == 'MOVIE':
+                    if strip.filepath:
+                        add_entry(strip.name, resolve_path(strip.filepath), "Movie Strip")
+                elif strip.type == 'IMAGE':
+                    if strip.directory and len(strip.elements) > 0:
+                        directory = resolve_path(strip.directory)
+                        members = [os.path.join(directory, e.filename) for e in strip.elements]
+                        add_entry(strip.name, members[0], "Image Strip", members)
 
     props.total_files = len(props.external_files)
     props.total_size = total_size
@@ -375,10 +413,6 @@ def scan_external_files(context):
 
     return {"success": True, "count": props.total_files}
 
-
-# =============================================================================
-# Operators
-# =============================================================================
 
 class PROJMAN_OT_scan_files(Operator):
     """Scan the project for external file references"""
@@ -407,7 +441,6 @@ class PROJMAN_OT_collect_files(Operator):
     def execute(self, context):
         props = context.scene.project_manager
 
-        # Validation
         if not props.destination_path:
             self.report({'ERROR'}, "Please select a destination folder")
             return {'CANCELLED'}
@@ -421,23 +454,21 @@ class PROJMAN_OT_collect_files(Operator):
             return {'CANCELLED'}
 
         dest_path = bpy.path.abspath(props.destination_path)
-
-        # Create destination folder if it doesn't exist
         os.makedirs(dest_path, exist_ok=True)
 
-        # Create subfolders for organization
         if not props.flatten_folders:
-            for folder in ["textures", "sounds", "fonts", "videos", "caches", "volumes", "libraries"]:
+            for folder in sorted(set(TYPE_TO_FOLDER.values())):
                 os.makedirs(os.path.join(dest_path, folder), exist_ok=True)
 
-        # Track path mappings for relinking
         path_mapping = {}
         copied_count = 0
         failed_count = 0
 
-        # Copy files
         for file_entry in props.external_files:
             if not file_entry.selected:
+                continue
+
+            if file_entry.filepath in path_mapping:
                 continue
 
             if not file_entry.exists:
@@ -445,57 +476,53 @@ class PROJMAN_OT_collect_files(Operator):
                 continue
 
             try:
-                # Determine destination subfolder
                 if props.flatten_folders:
-                    dest_subfolder = ""
+                    target_dir = dest_path
                 else:
-                    type_to_folder = {
-                        "Image": "textures",
-                        "Sound": "sounds",
-                        "Font": "fonts",
-                        "Movie Clip": "videos",
-                        "Cache File": "caches",
-                        "Volume": "volumes",
-                        "Library": "libraries"
-                    }
-                    dest_subfolder = type_to_folder.get(file_entry.file_type, "")
+                    subfolder = TYPE_TO_FOLDER.get(file_entry.file_type, "")
+                    target_dir = os.path.join(dest_path, subfolder) if subfolder else dest_path
 
-                # Determine filename
-                if props.rename_to_match:
-                    # Use datablock name + original extension
-                    _, ext = os.path.splitext(file_entry.filepath)
-                    new_filename = file_entry.name + ext
+                if file_entry.member_files:
+                    members = [f for f in entry_member_files(file_entry) if os.path.isfile(f)]
+                    targets = [os.path.join(target_dir, os.path.basename(f)) for f in members]
+                    if any(os.path.exists(t) for t in targets):
+                        safe_name = re.sub(r"[\\/:]", "_", file_entry.name)
+                        counter = 1
+                        while os.path.exists(os.path.join(target_dir, f"{safe_name}_{counter}")):
+                            counter += 1
+                        target_dir = os.path.join(target_dir, f"{safe_name}_{counter}")
+                        os.makedirs(target_dir, exist_ok=True)
+                    for f in members:
+                        shutil.copy2(f, os.path.join(target_dir, os.path.basename(f)))
+                    path_mapping[file_entry.filepath] = os.path.join(
+                        target_dir, os.path.basename(file_entry.filepath))
+                    copied_count += 1
                 else:
-                    new_filename = os.path.basename(file_entry.filepath)
+                    if props.rename_to_match:
+                        _, ext = os.path.splitext(file_entry.filepath)
+                        new_filename = re.sub(r"[\\/:]", "_", file_entry.name) + ext
+                    else:
+                        new_filename = os.path.basename(file_entry.filepath)
 
-                # Build full destination path
-                if dest_subfolder:
-                    dest_file = os.path.join(dest_path, dest_subfolder, new_filename)
-                else:
-                    dest_file = os.path.join(dest_path, new_filename)
+                    dest_file = os.path.join(target_dir, new_filename)
+                    base, ext = os.path.splitext(dest_file)
+                    counter = 1
+                    while os.path.exists(dest_file):
+                        dest_file = f"{base}_{counter}{ext}"
+                        counter += 1
 
-                # Handle duplicates
-                base, ext = os.path.splitext(dest_file)
-                counter = 1
-                while os.path.exists(dest_file):
-                    dest_file = f"{base}_{counter}{ext}"
-                    counter += 1
-
-                # Copy the file
-                shutil.copy2(file_entry.filepath, dest_file)
-                path_mapping[file_entry.filepath] = dest_file
-                copied_count += 1
+                    shutil.copy2(file_entry.filepath, dest_file)
+                    path_mapping[file_entry.filepath] = dest_file
+                    copied_count += 1
 
             except Exception as e:
                 self.report({'WARNING'}, f"Failed to copy {file_entry.name}: {str(e)}")
                 failed_count += 1
 
-        # Copy and relink .blend file
         if props.copy_blend_file:
             blend_name = os.path.basename(bpy.data.filepath)
             dest_blend = os.path.join(dest_path, blend_name)
 
-            # Handle duplicate blend file name
             base, ext = os.path.splitext(dest_blend)
             counter = 1
             while os.path.exists(dest_blend):
@@ -503,59 +530,26 @@ class PROJMAN_OT_collect_files(Operator):
                 counter += 1
 
             if props.relink_paths:
-                # Save current file first to preserve state
-                bpy.ops.wm.save_mainfile()
-
-                # Remap paths to relative paths pointing to new locations
-                for file_entry in props.external_files:
-                    if file_entry.filepath in path_mapping:
-                        new_path = path_mapping[file_entry.filepath]
-                        # Make path relative to destination blend file
-                        rel_path = os.path.relpath(new_path, dest_path)
-                        rel_path = "//" + rel_path.replace("\\", "/")
-
-                        # Update the actual datablock path
-                        self._update_datablock_path(file_entry.name, file_entry.file_type, rel_path)
-
-                # Save to destination
-                bpy.ops.wm.save_as_mainfile(filepath=dest_blend, copy=True)
-
-                # Restore original paths
-                bpy.ops.wm.revert_mainfile()
+                restores = []
+                try:
+                    for file_entry in props.external_files:
+                        new_abs = path_mapping.get(file_entry.filepath)
+                        if not new_abs:
+                            continue
+                        rel_path = "//" + os.path.relpath(new_abs, dest_path).replace("\\", "/")
+                        restore = apply_new_path(file_entry.name, file_entry.file_type, rel_path)
+                        if restore is not None:
+                            restores.append(restore)
+                    bpy.ops.wm.save_as_mainfile(filepath=dest_blend, copy=True, relative_remap=False)
+                finally:
+                    for owner, attr, old in reversed(restores):
+                        setattr(owner, attr, old)
             else:
-                # Just copy the blend file without relinking
                 shutil.copy2(bpy.data.filepath, dest_blend)
 
         self.report({'INFO'}, f"Collected {copied_count} files to {dest_path}" +
                     (f" ({failed_count} failed)" if failed_count > 0 else ""))
         return {'FINISHED'}
-
-    def _update_datablock_path(self, name, file_type, new_path):
-        """Update the filepath of a datablock."""
-        try:
-            if file_type == "Image":
-                if name in bpy.data.images:
-                    bpy.data.images[name].filepath = new_path
-            elif file_type == "Sound":
-                if name in bpy.data.sounds:
-                    bpy.data.sounds[name].filepath = new_path
-            elif file_type == "Font":
-                if name in bpy.data.fonts:
-                    bpy.data.fonts[name].filepath = new_path
-            elif file_type == "Movie Clip":
-                if name in bpy.data.movieclips:
-                    bpy.data.movieclips[name].filepath = new_path
-            elif file_type == "Cache File":
-                if name in bpy.data.cache_files:
-                    bpy.data.cache_files[name].filepath = new_path
-            elif file_type == "Volume":
-                if name in bpy.data.volumes:
-                    bpy.data.volumes[name].filepath = new_path
-            elif file_type == "Library":
-                if name in bpy.data.libraries:
-                    bpy.data.libraries[name].filepath = new_path
-        except Exception:
-            pass  # Silently fail for individual path updates
 
 
 class PROJMAN_OT_select_all(Operator):
@@ -603,16 +597,15 @@ class PROJMAN_OT_open_destination(Operator):
             self.report({'ERROR'}, "Destination folder does not exist")
             return {'CANCELLED'}
 
-        # Open folder in system file browser
         import subprocess
         import platform
 
         system = platform.system()
         if system == "Windows":
             os.startfile(dest_path)
-        elif system == "Darwin":  # macOS
+        elif system == "Darwin":
             subprocess.run(["open", dest_path])
-        else:  # Linux
+        else:
             subprocess.run(["xdg-open", dest_path])
 
         return {'FINISHED'}
@@ -629,12 +622,11 @@ class PROJMAN_OT_pack_all(Operator):
         packed_count = 0
         failed_count = 0
 
-        # Pack Images
         if props.pack_images:
             for img in bpy.data.images:
                 if img.packed_file or img.source in {'GENERATED', 'VIEWER'}:
                     continue
-                if props.exclude_unused and not is_datablock_used(img):
+                if props.exclude_unused and img.users == 0:
                     continue
                 if img.filepath:
                     try:
@@ -644,12 +636,11 @@ class PROJMAN_OT_pack_all(Operator):
                         self.report({'WARNING'}, f"Failed to pack {img.name}: {str(e)}")
                         failed_count += 1
 
-        # Pack Sounds
         if props.pack_sounds:
             for sound in bpy.data.sounds:
                 if sound.packed_file:
                     continue
-                if props.exclude_unused and not is_datablock_used(sound):
+                if props.exclude_unused and sound.users == 0:
                     continue
                 if sound.filepath:
                     try:
@@ -659,14 +650,13 @@ class PROJMAN_OT_pack_all(Operator):
                         self.report({'WARNING'}, f"Failed to pack {sound.name}: {str(e)}")
                         failed_count += 1
 
-        # Pack Fonts
         if props.pack_fonts:
             for font in bpy.data.fonts:
                 if font.packed_file:
                     continue
                 if not font.filepath or font.filepath == "<builtin>":
                     continue
-                if props.exclude_unused and not is_datablock_used(font):
+                if props.exclude_unused and font.users == 0:
                     continue
                 try:
                     font.pack()
@@ -713,12 +703,10 @@ class PROJMAN_OT_scan_duplicates(Operator):
         props = context.scene.project_manager
         props.duplicate_groups.clear()
 
-        # First, make sure we have scanned for external files
         if len(props.external_files) == 0:
             scan_external_files(context)
 
-        # Build hash map
-        hash_map = {}  # hash -> list of (name, filepath, file_type, size)
+        hash_map = {}
 
         for file_entry in props.external_files:
             if not file_entry.exists:
@@ -736,21 +724,21 @@ class PROJMAN_OT_scan_duplicates(Operator):
                     'size': file_entry.file_size
                 })
 
-        # Find duplicates (hashes with more than one file)
         duplicate_count = 0
-        wasted_size = 0
+        wasted_size = 0.0
 
         for file_hash, files in hash_map.items():
-            if len(files) > 1:
+            unique_paths = {f['filepath'] for f in files}
+            if len(unique_paths) > 1:
                 dup_group = props.duplicate_groups.add()
                 dup_group.hash_value = file_hash
                 dup_group.file_count = len(files)
                 dup_group.file_names = ", ".join([f['name'] for f in files])
                 dup_group.file_type = files[0]['file_type']
-                dup_group.total_size = files[0]['size'] * len(files)
+                dup_group.total_size = files[0]['size'] * len(unique_paths)
 
-                duplicate_count += len(files) - 1
-                wasted_size += files[0]['size'] * (len(files) - 1)
+                duplicate_count += len(unique_paths) - 1
+                wasted_size += files[0]['size'] * (len(unique_paths) - 1)
 
         props.duplicate_count = duplicate_count
         props.duplicate_wasted_size = wasted_size
@@ -778,7 +766,6 @@ class PROJMAN_OT_consolidate_duplicates(Operator):
 
         consolidated_count = 0
 
-        # Build a map from hash to the canonical filepath
         hash_to_files = {}
         for file_entry in props.external_files:
             if file_entry.file_hash and file_entry.exists:
@@ -786,98 +773,50 @@ class PROJMAN_OT_consolidate_duplicates(Operator):
                     hash_to_files[file_entry.file_hash] = []
                 hash_to_files[file_entry.file_hash].append(file_entry)
 
-        # For each duplicate group, update all datablocks to point to the first file
         for dup_group in props.duplicate_groups:
             files = hash_to_files.get(dup_group.hash_value, [])
             if len(files) < 2:
                 continue
 
-            # Use the first file as the canonical source
             canonical = files[0]
             canonical_path = canonical.filepath
 
-            # Make it relative if possible
             if bpy.data.filepath:
                 try:
                     canonical_path = bpy.path.relpath(canonical_path)
                 except ValueError:
-                    pass  # Different drive on Windows
+                    pass
 
-            # Update all other datablocks to use the canonical path
             for dup_file in files[1:]:
-                self._update_datablock_path(dup_file.name, dup_file.file_type, canonical_path)
-                consolidated_count += 1
+                if dup_file.filepath == canonical.filepath:
+                    continue
+                if apply_new_path(dup_file.name, dup_file.file_type, canonical_path) is not None:
+                    consolidated_count += 1
 
         if consolidated_count > 0:
             self.report({'INFO'}, f"Consolidated {consolidated_count} duplicate references")
-            # Re-scan to update the list
             scan_external_files(context)
         else:
             self.report({'INFO'}, "No duplicates to consolidate")
 
         return {'FINISHED'}
 
-    def _update_datablock_path(self, name, file_type, new_path):
-        """Update the filepath of a datablock."""
-        try:
-            if file_type == "Image":
-                if name in bpy.data.images:
-                    bpy.data.images[name].filepath = new_path
-            elif file_type == "Sound":
-                if name in bpy.data.sounds:
-                    bpy.data.sounds[name].filepath = new_path
-            elif file_type == "Font":
-                if name in bpy.data.fonts:
-                    bpy.data.fonts[name].filepath = new_path
-            elif file_type == "Movie Clip":
-                if name in bpy.data.movieclips:
-                    bpy.data.movieclips[name].filepath = new_path
-            elif file_type == "Cache File":
-                if name in bpy.data.cache_files:
-                    bpy.data.cache_files[name].filepath = new_path
-            elif file_type == "Volume":
-                if name in bpy.data.volumes:
-                    bpy.data.volumes[name].filepath = new_path
-            elif file_type == "Library":
-                if name in bpy.data.libraries:
-                    bpy.data.libraries[name].filepath = new_path
-        except Exception:
-            pass
-
-
-# =============================================================================
-# UI List
-# =============================================================================
 
 class PROJMAN_UL_files(UIList):
-    """UI List for displaying external files."""
 
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname):
         if self.layout_type in {'DEFAULT', 'COMPACT'}:
             row = layout.row(align=True)
 
-            # Selection checkbox
             row.prop(item, "selected", text="")
 
-            # Status icon
             if not item.exists:
                 row.label(text="", icon='ERROR')
             else:
-                type_icons = {
-                    "Image": 'IMAGE_DATA',
-                    "Sound": 'SOUND',
-                    "Font": 'FONT_DATA',
-                    "Movie Clip": 'FILE_MOVIE',
-                    "Cache File": 'FILE_CACHE',
-                    "Volume": 'VOLUME_DATA',
-                    "Library": 'LIBRARY_DATA_DIRECT'
-                }
-                row.label(text="", icon=type_icons.get(item.file_type, 'FILE'))
+                row.label(text="", icon=TYPE_ICONS.get(item.file_type, 'FILE'))
 
-            # File name
             row.label(text=item.name)
 
-            # File size
             if item.exists:
                 row.label(text=format_size(item.file_size))
             else:
@@ -889,28 +828,15 @@ class PROJMAN_UL_files(UIList):
 
 
 class PROJMAN_UL_duplicates(UIList):
-    """UI List for displaying duplicate file groups."""
 
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname):
         if self.layout_type in {'DEFAULT', 'COMPACT'}:
             row = layout.row(align=True)
 
-            # Type icon
-            type_icons = {
-                "Image": 'IMAGE_DATA',
-                "Sound": 'SOUND',
-                "Font": 'FONT_DATA',
-                "Movie Clip": 'FILE_MOVIE',
-                "Cache File": 'FILE_CACHE',
-                "Volume": 'VOLUME_DATA',
-                "Library": 'LIBRARY_DATA_DIRECT'
-            }
-            row.label(text="", icon=type_icons.get(item.file_type, 'FILE'))
+            row.label(text="", icon=TYPE_ICONS.get(item.file_type, 'FILE'))
 
-            # File count
             row.label(text=f"{item.file_count}x")
 
-            # File names (truncated)
             names = item.file_names
             if len(names) > 40:
                 names = names[:37] + "..."
@@ -921,12 +847,7 @@ class PROJMAN_UL_duplicates(UIList):
             layout.label(text="", icon='DUPLICATE')
 
 
-# =============================================================================
-# Panels
-# =============================================================================
-
 class PROJMAN_PT_main(Panel):
-    """Main panel for Project Manifest."""
     bl_label = "Project Manifest"
     bl_idname = "PROJMAN_PT_main"
     bl_space_type = 'PROPERTIES'
@@ -938,7 +859,6 @@ class PROJMAN_PT_main(Panel):
         layout = self.layout
         props = context.scene.project_manager
 
-        # Destination folder
         layout.label(text="Destination Folder:")
         row = layout.row(align=True)
         row.prop(props, "destination_path", text="")
@@ -946,7 +866,6 @@ class PROJMAN_PT_main(Panel):
 
 
 class PROJMAN_PT_options(Panel):
-    """Options panel for Project Manager."""
     bl_label = "Include"
     bl_idname = "PROJMAN_PT_options"
     bl_space_type = 'PROPERTIES'
@@ -958,7 +877,6 @@ class PROJMAN_PT_options(Panel):
         layout = self.layout
         props = context.scene.project_manager
 
-        # File type toggles
         col = layout.column(align=True)
 
         row = col.row(align=True)
@@ -973,10 +891,10 @@ class PROJMAN_PT_options(Panel):
 
         row = col.row(align=True)
         row.prop(props, "include_libraries", toggle=True)
+        row.prop(props, "include_sequencer", toggle=True)
 
 
 class PROJMAN_PT_settings(Panel):
-    """Settings panel for Project Manager."""
     bl_label = "Settings"
     bl_idname = "PROJMAN_PT_settings"
     bl_space_type = 'PROPERTIES'
@@ -1004,7 +922,6 @@ class PROJMAN_PT_settings(Panel):
 
 
 class PROJMAN_PT_files(Panel):
-    """Files panel for Project Manager."""
     bl_label = "External Files"
     bl_idname = "PROJMAN_PT_files"
     bl_space_type = 'PROPERTIES'
@@ -1016,10 +933,8 @@ class PROJMAN_PT_files(Panel):
         layout = self.layout
         props = context.scene.project_manager
 
-        # Scan button
         layout.operator("project_manager.scan_files", icon='FILE_REFRESH')
 
-        # Statistics
         if props.total_files > 0:
             box = layout.box()
             col = box.column(align=True)
@@ -1028,7 +943,6 @@ class PROJMAN_PT_files(Panel):
             if props.missing_files > 0:
                 col.label(text=f"Missing: {props.missing_files}", icon='ERROR')
 
-        # File list
         if len(props.external_files) > 0:
             row = layout.row()
             row.template_list(
@@ -1038,19 +952,16 @@ class PROJMAN_PT_files(Panel):
                 rows=5
             )
 
-            # Selection buttons
             row = layout.row(align=True)
             row.operator("project_manager.select_all", text="All")
             row.operator("project_manager.deselect_all", text="None")
 
-            # Show selected file path
             if props.active_file_index < len(props.external_files):
                 active = props.external_files[props.active_file_index]
                 layout.label(text=active.filepath, icon='FILE')
 
 
 class PROJMAN_PT_actions(Panel):
-    """Actions panel for Project Manager."""
     bl_label = "Collect"
     bl_idname = "PROJMAN_PT_actions"
     bl_space_type = 'PROPERTIES'
@@ -1062,21 +973,18 @@ class PROJMAN_PT_actions(Panel):
         layout = self.layout
         props = context.scene.project_manager
 
-        # Count selected files
         selected_count = sum(1 for f in props.external_files if f.selected)
         selected_size = sum(f.file_size for f in props.external_files if f.selected and f.exists)
 
         if selected_count > 0:
             layout.label(text=f"Selected: {selected_count} files ({format_size(selected_size)})")
 
-        # Collect button
         row = layout.row()
         row.scale_y = 1.5
         row.operator("project_manager.collect_files", icon='EXPORT')
 
 
 class PROJMAN_PT_packing(Panel):
-    """Packing panel for Project Manager."""
     bl_label = "Pack into .blend"
     bl_idname = "PROJMAN_PT_packing"
     bl_space_type = 'PROPERTIES'
@@ -1089,7 +997,6 @@ class PROJMAN_PT_packing(Panel):
         layout = self.layout
         props = context.scene.project_manager
 
-        # Selective packing options
         layout.label(text="File Types to Pack:")
         col = layout.column(align=True)
         row = col.row(align=True)
@@ -1099,7 +1006,6 @@ class PROJMAN_PT_packing(Panel):
 
         layout.separator()
 
-        # Pack/Unpack buttons
         row = layout.row(align=True)
         row.scale_y = 1.3
         row.operator("project_manager.pack_all", icon='PACKAGE')
@@ -1107,7 +1013,6 @@ class PROJMAN_PT_packing(Panel):
 
 
 class PROJMAN_PT_duplicates(Panel):
-    """Duplicate detection panel for Project Manager."""
     bl_label = "Duplicate Detection"
     bl_idname = "PROJMAN_PT_duplicates"
     bl_space_type = 'PROPERTIES'
@@ -1120,17 +1025,14 @@ class PROJMAN_PT_duplicates(Panel):
         layout = self.layout
         props = context.scene.project_manager
 
-        # Scan for duplicates button
         layout.operator("project_manager.scan_duplicates", icon='VIEWZOOM')
 
-        # Statistics
         if props.duplicate_count > 0:
             box = layout.box()
             col = box.column(align=True)
             col.label(text=f"Duplicate References: {props.duplicate_count}")
             col.label(text=f"Wasted Space: {format_size(props.duplicate_wasted_size)}")
 
-        # Duplicate groups list
         if len(props.duplicate_groups) > 0:
             row = layout.row()
             row.template_list(
@@ -1140,7 +1042,6 @@ class PROJMAN_PT_duplicates(Panel):
                 rows=4
             )
 
-            # Show full file names for selected group
             if props.active_duplicate_index < len(props.duplicate_groups):
                 active_dup = props.duplicate_groups[props.active_duplicate_index]
                 box = layout.box()
@@ -1148,16 +1049,11 @@ class PROJMAN_PT_duplicates(Panel):
                 for name in active_dup.file_names.split(", "):
                     box.label(text=f"  {name}")
 
-            # Consolidate button
             layout.separator()
             row = layout.row()
             row.scale_y = 1.3
             row.operator("project_manager.consolidate_duplicates", icon='AUTOMERGE_ON')
 
-
-# =============================================================================
-# Registration
-# =============================================================================
 
 classes = (
     PROJMAN_ExternalFile,

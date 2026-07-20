@@ -1,4 +1,4 @@
-# Blender Project Manifest
+# Project Manifest
 
 A free, open-source Blender extension that collects, consolidates, and archives your Blender projects with all their external assets. Inspired by Adobe Premiere Pro's Project Manager.
 
@@ -6,7 +6,7 @@ A free, open-source Blender extension that collects, consolidates, and archives 
 <img width="562" height="525" alt="532160324-2661990f-ffc2-4530-9fca-f201bb6583dc" src="https://github.com/user-attachments/assets/1af6d089-a7e8-420d-8023-6ece2e30729b" />
 
 
-**Blender 4.2+ | GPL v3 | Free & Open Source**
+**Blender 4.3+ | GPL v3 | Free & Open Source**
 
 ---
 
@@ -24,7 +24,7 @@ When you need to **archive a project**, **move it to another machine**, or **sha
 
 ## The Solution
 
-**Blender Project Manifest** scans your project, finds every external file reference, and collects them all into a single organized folder. It can automatically update all the paths in your .blend file.
+**Project Manifest** scans your project, finds every external file reference, and collects them all into a single organized folder. It can automatically update all the paths in your .blend file.
 
 One click. Done.
 
@@ -43,13 +43,14 @@ One click. Done.
 
 ### Supported Asset Types
 
-- **Images** - Textures, HDRIs, reference images (PNG, JPG, EXR, HDR, TIFF, etc.)
+- **Images** - Textures, HDRIs, reference images (PNG, JPG, EXR, HDR, TIFF, etc.), including UDIM tile sets and image sequences
 - **Sounds** - Audio files for VSE or speaker objects (WAV, MP3, OGG, FLAC)
 - **Fonts** - Font files used by text objects (TTF, OTF)
 - **Video Clips** - Movie clips for tracking or compositing
 - **Cache Files** - Alembic (.abc) and USD files
-- **Volumes** - OpenVDB volumetric data
+- **Volumes** - OpenVDB volumetric data, including volume sequences
 - **Linked Libraries** - External .blend files
+- **Sequencer Strips** - Movie and image strips from the Video Sequencer
 
 ### Options
 
@@ -92,10 +93,10 @@ One click. Done.
 ### Method 2: Manual Installation
 
 1. Download or clone this repository
-2. Copy the `blender_project_manifest` folder to your Blender addons directory:
-   - **Windows:** `%APPDATA%\Blender Foundation\Blender\4.2\extensions\user_default\`
-   - **macOS:** `~/Library/Application Support/Blender/4.2/extensions/user_default/`
-   - **Linux:** `~/.config/blender/4.2/extensions/user_default/`
+2. Copy the `project_manifest` folder to your Blender addons directory:
+   - **Windows:** `%APPDATA%\Blender Foundation\Blender\4.3\extensions\user_default\`
+   - **macOS:** `~/Library/Application Support/Blender/4.3/extensions/user_default/`
+   - **Linux:** `~/.config/blender/4.3/extensions/user_default/`
 3. Restart Blender and enable in Preferences
 
 ---
@@ -125,7 +126,7 @@ In the **Include** sub-panel, toggle which asset types to collect:
 ```
 [x] Images    [x] Sounds    [x] Fonts
 [x] Videos    [x] Caches    [x] Volumes
-[x] Libraries
+[x] Libraries [x] Sequencer Strips
 ```
 
 #### 3. Configure Settings
@@ -235,7 +236,7 @@ Files that are already packed into the .blend (embedded) are skipped since they'
 
 Planned features for future releases:
 
-- [ ] **Sequence Support** - Handle image sequences intelligently
+- [x] **Sequence Support** - Handle image sequences intelligently
 - [ ] **Transcode Option** - Convert videos to a consistent format
 - [ ] **CLI Mode** - Run collection from command line for batch processing
 
@@ -243,7 +244,7 @@ Planned features for future releases:
 
 ## Requirements
 
-- **Blender 4.2** or newer
+- **Blender 4.3** or newer
 - **Operating System**: Windows, macOS, or Linux
 
 ---
@@ -260,10 +261,10 @@ Contributions are welcome! Here's how you can help:
 
 ```bash
 # Clone the repository
-git clone https://github.com/maybegrim/Blender-Project-Manager.git
+git clone https://github.com/maybegrim/Blender-Project-Manifest.git
 
 # Create a symlink to your Blender extensions folder (example for Windows)
-mklink /D "%APPDATA%\Blender Foundation\Blender\4.2\extensions\user_default\blender_project_manifest" "path\to\repo\blender_project_manifest"
+mklink /D "%APPDATA%\Blender Foundation\Blender\4.3\extensions\user_default\project_manifest" "path\to\repo\project_manifest"
 ```
 
 ### Code Style
